@@ -4,24 +4,285 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, Result, StatusCode};
 use hyper_util::rt::TokioIo;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Region};
+use sled::Db;
 
-type SharedStore = Arc<RwLock<HashMap<String, String>>>;
+// Add to Cargo.toml:
+// [dependencies]
+// # ... previous dependencies ...
+// dotenv = "0.15"
+
+const MAGIC_NUMBER: u64 = 0x5343524942;
+const SEGMENT_VERSION: u32 = 1;
+const FLUSH_THRESHOLD: usize = 1000;
+const FLUSH_INTERVAL_SECS: u64 = 300;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SegmentHeader {
+    magic: u64,
+    version: u32,
+    record_count: u64,
+    timestamp: i64,
+    min_key: String,
+    max_key: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SegmentMetadata {
+    id: String,
+    s3_key: String,
+    record_count: usize,
+    min_key: String,
+    max_key: String,
+    created_at: i64,
+    size_bytes: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Manifest {
+    version: u64,
+    segments: Vec<SegmentMetadata>,
+    last_updated: i64,
+}
+
+impl Manifest {
+    fn new() -> Self {
+        Self {
+            version: 0,
+            segments: Vec::new(),
+            last_updated: Self::now(),
+        }
+    }
+
+    fn add_segment(&mut self, segment: SegmentMetadata) {
+        self.segments.push(segment);
+        self.version += 1;
+        self.last_updated = Self::now();
+    }
+
+    fn now() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+}
+
+struct SegmentFlusher {
+    db: Arc<Db>,
+    s3_client: S3Client,
+    bucket: String,
+    manifest: Arc<RwLock<Manifest>>,
+    flush_threshold: usize,
+}
+
+impl SegmentFlusher {
+    async fn new(db: Arc<Db>, bucket: String, flush_threshold: usize) -> Self {
+        // Build S3 client with MinIO support
+        let s3_client = Self::build_s3_client().await;
+
+        // Load or create manifest
+        let manifest = Arc::new(RwLock::new(
+            Self::load_manifest(&s3_client, &bucket).await
+                .unwrap_or_else(|| Manifest::new())
+        ));
+
+        Self {
+            db,
+            s3_client,
+            bucket,
+            manifest,
+            flush_threshold,
+        }
+    }
+
+    async fn build_s3_client() -> S3Client {
+        // Check for custom endpoint (MinIO)
+        let endpoint_url = std::env::var("AWS_ENDPOINT_URL").ok();
+        
+        let config_builder = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        
+        // Build S3-specific config
+        let mut s3_config_builder = S3ConfigBuilder::from(&config_builder);
+
+        // If custom endpoint provided (MinIO/LocalStack)
+        if let Some(endpoint) = endpoint_url {
+            println!("🔧 Using custom S3 endpoint: {}", endpoint);
+            s3_config_builder = s3_config_builder
+                .endpoint_url(&endpoint)
+                .force_path_style(true); // Required for MinIO
+        }
+
+        // Override region if needed
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string());
+        
+        s3_config_builder = s3_config_builder.region(Region::new(region));
+
+        S3Client::from_conf(s3_config_builder.build())
+    }
+
+    async fn load_manifest(s3_client: &S3Client, bucket: &str) -> Option<Manifest> {
+        let result = s3_client
+            .get_object()
+            .bucket(bucket)
+            .key("manifest.json")
+            .send()
+            .await
+            .ok()?;
+
+        let bytes = result.body.collect().await.ok()?.into_bytes();
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    async fn save_manifest(&self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let manifest = self.manifest.read().await;
+        let json = serde_json::to_vec_pretty(&*manifest)?;
+
+        self.s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key("manifest.json")
+            .body(ByteStream::from(json))
+            .content_type("application/json")
+            .send()
+            .await?;
+
+        Ok(())
+    }
+
+    async fn start_background_flusher(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(FLUSH_INTERVAL_SECS));
+
+        loop {
+            interval.tick().await;
+
+            let key_count = self.db.len();
+            println!("📊 Current keys in Sled: {}", key_count);
+
+            if key_count >= self.flush_threshold {
+                println!("🚀 Flush threshold reached ({} keys), starting flush...", key_count);
+                match self.flush_to_s3().await {
+                    Ok(segment_id) => println!("✅ Successfully flushed segment: {}", segment_id),
+                    Err(e) => eprintln!("❌ Flush error: {}", e),
+                }
+            }
+        }
+    }
+
+    async fn flush_to_s3(&self) -> std::result::Result<String, Box<dyn std::error::Error>> {
+        println!("📦 Starting segment flush...");
+
+        let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for item in self.db.iter() {
+            let (key, value) = item?;
+            records.push((key.to_vec(), value.to_vec()));
+        }
+
+        if records.is_empty() {
+            return Err("No data to flush".into());
+        }
+
+        records.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let record_count = records.len();
+        let min_key = String::from_utf8_lossy(&records[0].0).to_string();
+        let max_key = String::from_utf8_lossy(&records[record_count - 1].0).to_string();
+
+        println!("📝 Sorted {} records ({}...{})", 
+                 record_count, 
+                 &min_key[..min_key.len().min(20)], 
+                 &max_key[..max_key.len().min(20)]);
+
+        let segment_data = self.build_segment_binary(&records)?;
+        let segment_size = segment_data.len();
+
+        let timestamp = Manifest::now();
+        let segment_id = format!("segment_{}", timestamp);
+        let s3_key = format!("segments/{}.bin", segment_id);
+
+        println!("☁️  Uploading {} bytes to s3://{}/{}", 
+                 segment_size, self.bucket, s3_key);
+
+        self.s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .body(ByteStream::from(segment_data))
+            .content_type("application/octet-stream")
+            .send()
+            .await?;
+
+        let metadata = SegmentMetadata {
+            id: segment_id.clone(),
+            s3_key: s3_key.clone(),
+            record_count,
+            min_key,
+            max_key,
+            created_at: timestamp,
+            size_bytes: segment_size,
+        };
+
+        {
+            let mut manifest = self.manifest.write().await;
+            manifest.add_segment(metadata);
+        }
+
+        self.save_manifest().await?;
+
+        println!("✨ Segment {} uploaded and manifest updated", segment_id);
+        Ok(segment_id)
+    }
+
+    fn build_segment_binary(&self, records: &[(Vec<u8>, Vec<u8>)]) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut buffer = Vec::new();
+
+        let header = SegmentHeader {
+            magic: MAGIC_NUMBER,
+            version: SEGMENT_VERSION,
+            record_count: records.len() as u64,
+            timestamp: Manifest::now(),
+            min_key: String::from_utf8_lossy(&records[0].0).to_string(),
+            max_key: String::from_utf8_lossy(&records[records.len() - 1].0).to_string(),
+        };
+
+        let header_bytes = bincode::serialize(&header)?;
+        buffer.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&header_bytes);
+
+        for (key, value) in records {
+            buffer.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(key);
+            buffer.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(value);
+        }
+
+        Ok(buffer)
+    }
+}
+
+type SharedStore = Arc<Db>;
+type SharedFlusher = Arc<SegmentFlusher>;
 
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     store: SharedStore,
+    flusher: SharedFlusher,
 ) -> Result<Response<Full<Bytes>>> {
     let path = req.uri().path().to_string();
 
     match (req.method(), path.as_str()) {
         (&Method::PUT, path) if path.starts_with('/') => {
-            let key = path[1..].to_string(); // Remove leading '/'
-
+            let key = path[1..].to_string();
             if key.is_empty() {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
@@ -29,7 +290,6 @@ async fn handle_request(
                     .unwrap());
             }
 
-            // Read the request body
             let body_bytes = match req.collect().await {
                 Ok(collected) => collected.to_bytes(),
                 Err(_) => {
@@ -40,23 +300,27 @@ async fn handle_request(
                 }
             };
 
-            let value = String::from_utf8_lossy(&body_bytes).to_string();
-
-            // Store the key-value pair
-            {
-                let mut store = store.write().await;
-                store.insert(key.clone(), value);
+            match store.insert(key.as_bytes(), body_bytes.as_ref()) {
+                Ok(_) => {
+                    let _ = store.flush_async().await;
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from(format!(
+                            "✅ Stored: {} ({} bytes)",
+                            key,
+                            body_bytes.len()
+                        ))))
+                        .unwrap())
+                }
+                Err(e) => Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::from(format!("Error: {}", e))))
+                    .unwrap()),
             }
-
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from(format!("Stored key: {}", key))))
-                .unwrap())
         }
 
-        (&Method::GET, path) if path.starts_with('/') => {
-            let key = path[1..].to_string(); // Remove leading '/'
-
+        (&Method::GET, path) if path.starts_with('/') && !path.starts_with("/stats") && !path.starts_with("/manifest") && !path.starts_with("/health") => {
+            let key = path[1..].to_string();
             if key.is_empty() {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
@@ -64,31 +328,69 @@ async fn handle_request(
                     .unwrap());
             }
 
-            // Retrieve the value
-            let store = store.read().await;
-            match store.get(&key) {
-                Some(value) => Ok(Response::builder()
+            match store.get(key.as_bytes()) {
+                Ok(Some(value)) => Ok(Response::builder()
                     .status(StatusCode::OK)
-                    .body(Full::new(Bytes::from(value.clone())))
+                    .body(Full::new(Bytes::copy_from_slice(&value)))
                     .unwrap()),
-                None => Ok(Response::builder()
+                Ok(None) => Ok(Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(Full::new(Bytes::from("Key not found")))
+                    .unwrap()),
+                Err(e) => Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::from(format!("Error: {}", e))))
                     .unwrap()),
             }
         }
 
         (&Method::GET, "/stats") => {
-            let store = store.read().await;
             let count = store.len();
+            let size = store.size_on_disk().unwrap_or(0);
+            let manifest = flusher.manifest.read().await;
+
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
                 .body(Full::new(Bytes::from(format!(
-                    "{{\"total_keys\": {}}}",
-                    count
+                    "{{\"local_keys\": {}, \"disk_bytes\": {}, \"segments\": {}, \"manifest_version\": {}}}",
+                    count, size, manifest.segments.len(), manifest.version
                 ))))
                 .unwrap())
+        }
+
+        (&Method::GET, "/manifest") => {
+            let manifest = flusher.manifest.read().await;
+            let json = serde_json::to_string_pretty(&*manifest).unwrap();
+
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from(json)))
+                .unwrap())
+        }
+
+        (&Method::GET, "/health") => {
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::from("OK")))
+                .unwrap())
+        }
+
+        (&Method::POST, "/flush") => {
+            match flusher.flush_to_s3().await {
+                Ok(segment_id) => Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Full::new(Bytes::from(format!(
+                        "✅ Flushed segment: {}",
+                        segment_id
+                    ))))
+                    .unwrap()),
+                Err(e) => Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::from(format!("❌ Flush failed: {}", e))))
+                    .unwrap()),
+            }
         }
 
         _ => Ok(Response::builder()
@@ -100,32 +402,89 @@ async fn handle_request(
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Load .env file if exists
+    dotenv::dotenv().ok();
+
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = TcpListener::bind(addr).await?;
 
-    // Create shared HashMap store
-    let store: SharedStore = Arc::new(RwLock::new(HashMap::new()));
+    // Configuration
+    let bucket = std::env::var("S3_BUCKET")
+        .unwrap_or_else(|_| "hyra-scribe-ledger".to_string());
+    let flush_threshold = std::env::var("FLUSH_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(FLUSH_THRESHOLD);
 
-    println!("HashCache server running on http://{}", addr);
-    println!("Usage:");
-    println!("  PUT: curl -X PUT http://localhost:3000/mykey --data-binary \"myvalue\"");
-    println!("  GET: curl http://localhost:3000/mykey");
-    println!("  Stats: curl http://localhost:3000/stats");
+    // Initialize Sled
+    let db_path = "./scribe_data";
+    let store: SharedStore = Arc::new(sled::open(db_path)?);
+
+    // Initialize S3 Flusher
+    let flusher = Arc::new(
+        SegmentFlusher::new(
+            Arc::clone(&store),
+            bucket.clone(),
+            flush_threshold,
+        )
+        .await,
+    );
+
+    // Start background flusher
+    let flusher_clone = Arc::clone(&flusher);
+    tokio::spawn(async move {
+        flusher_clone.start_background_flusher().await;
+    });
+
+    println!("╔════════════════════════════════════════════════════════════╗");
+    println!("║  🚀 Hyra Scribe Ledger - Phase 2 (S3 Segments)           ║");
+    println!("╚════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("📡 Server: http://{}", addr);
+    println!("🪣 S3 Bucket: {}", bucket);
+    println!("⚙️  Flush Threshold: {} keys", flush_threshold);
+    println!();
+    println!("📖 API Endpoints:");
+    println!("  PUT    /{{key}}     - Store key-value");
+    println!("  GET    /{{key}}     - Retrieve value");
+    println!("  GET    /stats     - System statistics");
+    println!("  GET    /manifest  - View segment manifest");
+    println!("  GET    /health    - Health check");
+    println!("  POST   /flush     - Manual segment flush");
+    println!();
+    println!("✨ Features:");
+    println!("  ✓ Crash-safe WAL (Sled)");
+    println!("  ✓ Auto S3 flush (every {} sec or {} keys)", FLUSH_INTERVAL_SECS, flush_threshold);
+    println!("  ✓ Sorted segments");
+    println!("  ✓ Manifest tracking");
+    println!("  ✓ MinIO/S3 compatible");
+    println!();
+    println!("🔧 Configuration loaded from:");
+    println!("  • Environment variables");
+    println!("  • .env file (if exists)");
+    println!();
 
     loop {
         let (stream, _) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let store_clone = Arc::clone(&store);
+        let flusher_clone = Arc::clone(&flusher);
 
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new()
                 .serve_connection(
                     io,
-                    service_fn(move |req| handle_request(req, Arc::clone(&store_clone))),
+                    service_fn(move |req| {
+                        handle_request(
+                            req,
+                            Arc::clone(&store_clone),
+                            Arc::clone(&flusher_clone),
+                        )
+                    }),
                 )
                 .await
             {
-                eprintln!("Error serving connection: {:?}", err);
+                eprintln!("Connection error: {:?}", err);
             }
         });
     }

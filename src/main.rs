@@ -15,14 +15,14 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::config::{Builder as S3ConfigBuilder, Region};
 use sled::Db;
 
-// Add to Cargo.toml:
+// Cargo.toml - same as Phase 2 plus:
 // [dependencies]
-// # ... previous dependencies ...
-// dotenv = "0.15"
+// # ... previous ...
+// bytes = "1.5"
 
 const MAGIC_NUMBER: u64 = 0x5343524942;
 const SEGMENT_VERSION: u32 = 1;
-const FLUSH_THRESHOLD: usize = 1000;
+const FLUSH_THRESHOLD: usize = 100;
 const FLUSH_INTERVAL_SECS: u64 = 300;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -74,6 +74,14 @@ impl Manifest {
             .unwrap()
             .as_secs() as i64
     }
+
+    // NEW: Find segments that might contain a key
+    fn find_segments_for_key(&self, key: &str) -> Vec<&SegmentMetadata> {
+        self.segments
+            .iter()
+            .filter(|seg| key >= seg.min_key.as_str() && key <= seg.max_key.as_str())
+            .collect()
+    }
 }
 
 struct SegmentFlusher {
@@ -86,10 +94,7 @@ struct SegmentFlusher {
 
 impl SegmentFlusher {
     async fn new(db: Arc<Db>, bucket: String, flush_threshold: usize) -> Self {
-        // Build S3 client with MinIO support
         let s3_client = Self::build_s3_client().await;
-
-        // Load or create manifest
         let manifest = Arc::new(RwLock::new(
             Self::load_manifest(&s3_client, &bucket).await
                 .unwrap_or_else(|| Manifest::new())
@@ -105,29 +110,22 @@ impl SegmentFlusher {
     }
 
     async fn build_s3_client() -> S3Client {
-        // Check for custom endpoint (MinIO)
         let endpoint_url = std::env::var("AWS_ENDPOINT_URL").ok();
-        
         let config_builder = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        
-        // Build S3-specific config
         let mut s3_config_builder = S3ConfigBuilder::from(&config_builder);
 
-        // If custom endpoint provided (MinIO/LocalStack)
         if let Some(endpoint) = endpoint_url {
             println!("🔧 Using custom S3 endpoint: {}", endpoint);
             s3_config_builder = s3_config_builder
                 .endpoint_url(&endpoint)
-                .force_path_style(true); // Required for MinIO
+                .force_path_style(true);
         }
 
-        // Override region if needed
         let region = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string());
         
         s3_config_builder = s3_config_builder.region(Region::new(region));
-
         S3Client::from_conf(s3_config_builder.build())
     }
 
@@ -268,6 +266,125 @@ impl SegmentFlusher {
 
         Ok(buffer)
     }
+
+    // NEW: Search for key in S3 segments
+    async fn search_s3_for_key(&self, key: &str) -> Option<Vec<u8>> {
+        let manifest = self.manifest.read().await;
+        
+        // Find relevant segments
+        let segments = manifest.find_segments_for_key(key);
+        
+        if segments.is_empty() {
+            println!("🔍 No segments contain key range for: {}", key);
+            return None;
+        }
+
+        println!("🔍 Searching {} segment(s) for key: {}", segments.len(), key);
+
+        // Search segments from newest to oldest
+        for segment in segments.iter().rev() {
+            println!("  → Checking segment: {}", segment.id);
+            
+            if let Some(value) = self.search_segment(segment, key).await {
+                println!("  ✅ Found in segment: {}", segment.id);
+                
+                // Cache back to Sled for faster future access
+                let _ = self.db.insert(key.as_bytes(), value.as_slice());
+                let _ = self.db.flush_async().await;
+                
+                return Some(value);
+            }
+        }
+
+        println!("  ❌ Key not found in any segment");
+        None
+    }
+
+    // NEW: Search within a single segment
+    async fn search_segment(&self, segment: &SegmentMetadata, key: &str) -> Option<Vec<u8>> {
+        // Download segment from S3
+        let result = self.s3_client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&segment.s3_key)
+            .send()
+            .await
+            .ok()?;
+
+        let data = result.body.collect().await.ok()?.into_bytes();
+        
+        // Parse and search segment
+        self.parse_and_search_segment(&data, key)
+    }
+
+    // NEW: Parse segment binary and search for key
+    fn parse_and_search_segment(&self, data: &[u8], search_key: &str) -> Option<Vec<u8>> {
+        let mut offset = 0;
+
+        // Read header length
+        if data.len() < 4 {
+            return None;
+        }
+        let header_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        offset += 4;
+
+        // Skip header
+        if data.len() < offset + header_len {
+            return None;
+        }
+        offset += header_len;
+
+        // Binary search through records (since they're sorted)
+        let mut records: Vec<(String, Vec<u8>)> = Vec::new();
+
+        // First pass: collect all records
+        while offset < data.len() {
+            // Read key length
+            if data.len() < offset + 4 {
+                break;
+            }
+            let key_len = u32::from_le_bytes([
+                data[offset], 
+                data[offset + 1], 
+                data[offset + 2], 
+                data[offset + 3]
+            ]) as usize;
+            offset += 4;
+
+            // Read key
+            if data.len() < offset + key_len {
+                break;
+            }
+            let key = String::from_utf8_lossy(&data[offset..offset + key_len]).to_string();
+            offset += key_len;
+
+            // Read value length
+            if data.len() < offset + 4 {
+                break;
+            }
+            let value_len = u32::from_le_bytes([
+                data[offset], 
+                data[offset + 1], 
+                data[offset + 2], 
+                data[offset + 3]
+            ]) as usize;
+            offset += 4;
+
+            // Read value
+            if data.len() < offset + value_len {
+                break;
+            }
+            let value = data[offset..offset + value_len].to_vec();
+            offset += value_len;
+
+            records.push((key, value));
+        }
+
+        // Binary search for the key
+        records.binary_search_by(|probe| probe.0.as_str().cmp(search_key))
+            .ok()
+            .map(|idx| records[idx].1.clone())
+    }
 }
 
 type SharedStore = Arc<Db>;
@@ -319,6 +436,7 @@ async fn handle_request(
             }
         }
 
+        // UPDATED GET: Now searches S3 if not in local cache
         (&Method::GET, path) if path.starts_with('/') && !path.starts_with("/stats") && !path.starts_with("/manifest") && !path.starts_with("/health") => {
             let key = path[1..].to_string();
             if key.is_empty() {
@@ -328,19 +446,39 @@ async fn handle_request(
                     .unwrap());
             }
 
+            // 1. Check local Sled cache first
             match store.get(key.as_bytes()) {
-                Ok(Some(value)) => Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .body(Full::new(Bytes::copy_from_slice(&value)))
-                    .unwrap()),
-                Ok(None) => Ok(Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Full::new(Bytes::from("Key not found")))
-                    .unwrap()),
-                Err(e) => Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::new(Bytes::from(format!("Error: {}", e))))
-                    .unwrap()),
+                Ok(Some(value)) => {
+                    println!("🎯 Cache HIT: {}", key);
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("X-Cache", "HIT")
+                        .body(Full::new(Bytes::copy_from_slice(&value)))
+                        .unwrap());
+                }
+                Ok(None) => {
+                    println!("💨 Cache MISS: {}", key);
+                    // 2. Search S3 segments
+                    if let Some(value) = flusher.search_s3_for_key(&key).await {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header("X-Cache", "MISS-S3")
+                            .body(Full::new(Bytes::from(value)))
+                            .unwrap());
+                    }
+                    
+                    // 3. Not found anywhere
+                    return Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Full::new(Bytes::from("Key not found")))
+                        .unwrap());
+                }
+                Err(e) => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Full::new(Bytes::from(format!("Error: {}", e))))
+                        .unwrap());
+                }
             }
         }
 
@@ -348,13 +486,14 @@ async fn handle_request(
             let count = store.len();
             let size = store.size_on_disk().unwrap_or(0);
             let manifest = flusher.manifest.read().await;
+            let total_segment_records: usize = manifest.segments.iter().map(|s| s.record_count).sum();
 
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
                 .body(Full::new(Bytes::from(format!(
-                    "{{\"local_keys\": {}, \"disk_bytes\": {}, \"segments\": {}, \"manifest_version\": {}}}",
-                    count, size, manifest.segments.len(), manifest.version
+                    "{{\"local_keys\": {}, \"disk_bytes\": {}, \"segments\": {}, \"segment_records\": {}, \"manifest_version\": {}}}",
+                    count, size, manifest.segments.len(), total_segment_records, manifest.version
                 ))))
                 .unwrap())
         }
@@ -393,6 +532,24 @@ async fn handle_request(
             }
         }
 
+        // NEW: Clear local cache (for testing S3 reads)
+        (&Method::POST, "/clear-cache") => {
+            let cleared = store.clear().is_ok();
+            let _ = store.flush_async().await;
+            
+            if cleared {
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Full::new(Bytes::from("✅ Local cache cleared")))
+                    .unwrap())
+            } else {
+                Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::from("❌ Failed to clear cache")))
+                    .unwrap())
+            }
+        }
+
         _ => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::from("Not Found")))
@@ -402,13 +559,11 @@ async fn handle_request(
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Load .env file if exists
     dotenv::dotenv().ok();
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = TcpListener::bind(addr).await?;
 
-    // Configuration
     let bucket = std::env::var("S3_BUCKET")
         .unwrap_or_else(|_| "hyra-scribe-ledger".to_string());
     let flush_threshold = std::env::var("FLUSH_THRESHOLD")
@@ -416,11 +571,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sy
         .and_then(|s| s.parse().ok())
         .unwrap_or(FLUSH_THRESHOLD);
 
-    // Initialize Sled
     let db_path = "./scribe_data";
     let store: SharedStore = Arc::new(sled::open(db_path)?);
 
-    // Initialize S3 Flusher
     let flusher = Arc::new(
         SegmentFlusher::new(
             Arc::clone(&store),
@@ -430,14 +583,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sy
         .await,
     );
 
-    // Start background flusher
     let flusher_clone = Arc::clone(&flusher);
     tokio::spawn(async move {
         flusher_clone.start_background_flusher().await;
     });
 
     println!("╔════════════════════════════════════════════════════════════╗");
-    println!("║  🚀 Hyra Scribe Ledger - Phase 2 (S3 Segments)           ║");
+    println!("║  🚀 Hyra Scribe Ledger - Phase 3 (S3 Read Path)          ║");
     println!("╚════════════════════════════════════════════════════════════╝");
     println!();
     println!("📡 Server: http://{}", addr);
@@ -445,23 +597,20 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sy
     println!("⚙️  Flush Threshold: {} keys", flush_threshold);
     println!();
     println!("📖 API Endpoints:");
-    println!("  PUT    /{{key}}     - Store key-value");
-    println!("  GET    /{{key}}     - Retrieve value");
-    println!("  GET    /stats     - System statistics");
-    println!("  GET    /manifest  - View segment manifest");
-    println!("  GET    /health    - Health check");
-    println!("  POST   /flush     - Manual segment flush");
+    println!("  PUT    /{{key}}        - Store key-value");
+    println!("  GET    /{{key}}        - Retrieve (cache → S3)");
+    println!("  GET    /stats         - System statistics");
+    println!("  GET    /manifest      - View segment manifest");
+    println!("  GET    /health        - Health check");
+    println!("  POST   /flush         - Manual segment flush");
+    println!("  POST   /clear-cache   - Clear local cache (test S3 reads)");
     println!();
     println!("✨ Features:");
-    println!("  ✓ Crash-safe WAL (Sled)");
-    println!("  ✓ Auto S3 flush (every {} sec or {} keys)", FLUSH_INTERVAL_SECS, flush_threshold);
-    println!("  ✓ Sorted segments");
-    println!("  ✓ Manifest tracking");
-    println!("  ✓ MinIO/S3 compatible");
-    println!();
-    println!("🔧 Configuration loaded from:");
-    println!("  • Environment variables");
-    println!("  • .env file (if exists)");
+    println!("  ✓ Local Sled cache (fast reads)");
+    println!("  ✓ S3 fallback (cold storage)");
+    println!("  ✓ Binary search in segments");
+    println!("  ✓ Auto cache warming");
+    println!("  ✓ X-Cache header (HIT/MISS)");
     println!();
 
     loop {
@@ -470,7 +619,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sy
         let store_clone = Arc::clone(&store);
         let flusher_clone = Arc::clone(&flusher);
 
-        tokio::task::spawn(async move {
+        tokio::spawn(async move {
             if let Err(err) = http1::Builder::new()
                 .serve_connection(
                     io,

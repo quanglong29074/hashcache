@@ -1,9 +1,9 @@
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, Result, StatusCode};
 use hyper_util::rt::TokioIo;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,18 +17,18 @@ async fn handle_request(
     store: SharedStore,
 ) -> Result<Response<Full<Bytes>>> {
     let path = req.uri().path().to_string();
-    
+
     match (req.method(), path.as_str()) {
         (&Method::PUT, path) if path.starts_with('/') => {
             let key = path[1..].to_string(); // Remove leading '/'
-            
+
             if key.is_empty() {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Full::new(Bytes::from("Key cannot be empty")))
                     .unwrap());
             }
-            
+
             // Read the request body
             let body_bytes = match req.collect().await {
                 Ok(collected) => collected.to_bytes(),
@@ -39,31 +39,31 @@ async fn handle_request(
                         .unwrap());
                 }
             };
-            
+
             let value = String::from_utf8_lossy(&body_bytes).to_string();
-            
+
             // Store the key-value pair
             {
                 let mut store = store.write().await;
                 store.insert(key.clone(), value);
             }
-            
+
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .body(Full::new(Bytes::from(format!("Stored key: {}", key))))
                 .unwrap())
         }
-        
+
         (&Method::GET, path) if path.starts_with('/') => {
             let key = path[1..].to_string(); // Remove leading '/'
-            
+
             if key.is_empty() {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Full::new(Bytes::from("Key cannot be empty")))
                     .unwrap());
             }
-            
+
             // Retrieve the value
             let store = store.read().await;
             match store.get(&key) {
@@ -77,17 +77,20 @@ async fn handle_request(
                     .unwrap()),
             }
         }
-        
+
         (&Method::GET, "/stats") => {
             let store = store.read().await;
             let count = store.len();
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")
-                .body(Full::new(Bytes::from(format!("{{\"total_keys\": {}}}", count))))
+                .body(Full::new(Bytes::from(format!(
+                    "{{\"total_keys\": {}}}",
+                    count
+                ))))
                 .unwrap())
         }
-        
+
         _ => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::from("Not Found")))
@@ -99,10 +102,10 @@ async fn handle_request(
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = TcpListener::bind(addr).await?;
-    
+
     // Create shared HashMap store
     let store: SharedStore = Arc::new(RwLock::new(HashMap::new()));
-    
+
     println!("HashCache server running on http://{}", addr);
     println!("Usage:");
     println!("  PUT: curl -X PUT http://localhost:3000/mykey --data-binary \"myvalue\"");
